@@ -325,3 +325,184 @@ def test_check_objects_attr_name_none_tag_not_set():
 
     with pytest.raises(TypeError, match="could not be auto-detected.*non-empty string"):
         meta_obj._check_objects(steps, attr_name=None)
+
+
+# Tests for _MetaTagLogicMixin
+# ----------------------------
+# The mixin methods take a list of (name, estimator) tuples and either query
+# or set tags on the meta-object based on the tags of the components.
+
+
+def _named_components(*tag_dicts):
+    """Create list of (name, ComponentDummy) tuples with given dynamic tags."""
+    return [
+        (f"comp{i}", ComponentDummy().set_tags(**tags))
+        for i, tags in enumerate(tag_dicts)
+    ]
+
+
+@pytest.fixture(params=[MetaObjectTester, MetaEstimatorTester])
+def fixture_tag_logic_meta(request):
+    """Meta-object instance inheriting _MetaTagLogicMixin, object and estimator."""
+    return request.param()
+
+
+@pytest.mark.parametrize(
+    "tag_values, value, expected",
+    [
+        ([True, False, False], True, True),
+        ([False, False, True], True, True),
+        ([False, False, False], True, False),
+        (["a", "b", "c"], "b", True),
+        (["a", "b", "c"], "d", False),
+        ([], True, False),
+    ],
+)
+def test_anytagis(fixture_tag_logic_meta, tag_values, value, expected):
+    """Test _anytagis returns whether any component has tag value."""
+    estimators = _named_components(*[{"foo": v} for v in tag_values])
+
+    result = fixture_tag_logic_meta._anytagis("foo", value, estimators)
+
+    assert result is expected
+
+
+@pytest.mark.parametrize(
+    "tag_values, expected",
+    [
+        (["other", "yes"], "yes"),
+        (["other", "other"], "no"),
+    ],
+)
+def test_anytagis_then_set(fixture_tag_logic_meta, tag_values, expected):
+    """Test _anytagis_then_set sets value if any component matches, else other."""
+    estimators = _named_components(*[{"foo": v} for v in tag_values])
+
+    fixture_tag_logic_meta._anytagis_then_set(
+        "foo", value="yes", value_if_not="no", estimators=estimators
+    )
+
+    assert fixture_tag_logic_meta.get_tag("foo") == expected
+
+
+@pytest.mark.parametrize(
+    "tag_values, expected",
+    [
+        (["None", "None", "x", "y"], "x"),
+        (["x", "None", "y"], "x"),
+        ([42, "x"], 42),
+        (["None", "None"], "None"),
+    ],
+)
+def test_anytag_notnone_val(fixture_tag_logic_meta, tag_values, expected):
+    """Test _anytag_notnone_val returns first non-'None' tag value."""
+    estimators = _named_components(*[{"foo": v} for v in tag_values])
+
+    result = fixture_tag_logic_meta._anytag_notnone_val("foo", estimators)
+
+    assert result == expected
+
+
+def test_anytag_notnone_set_sets_first_notnone(fixture_tag_logic_meta):
+    """Test _anytag_notnone_set sets tag to first non-'None' component value."""
+    estimators = _named_components({"foo": "None"}, {"foo": "x"}, {"foo": "y"})
+
+    fixture_tag_logic_meta._anytag_notnone_set("foo", estimators)
+
+    assert fixture_tag_logic_meta.get_tag("foo") == "x"
+
+
+def test_anytag_notnone_set_all_none_leaves_tag(fixture_tag_logic_meta):
+    """Test _anytag_notnone_set does not change tag if all component values 'None'."""
+    fixture_tag_logic_meta.set_tags(foo="original")
+    estimators = _named_components({"foo": "None"}, {"foo": "None"})
+
+    fixture_tag_logic_meta._anytag_notnone_set("foo", estimators)
+
+    assert fixture_tag_logic_meta.get_tag("foo") == "original"
+
+
+@pytest.mark.parametrize(
+    "tag_pairs, expected",
+    [
+        # (left, mid) per component
+        # all left True before first mid -> linked and complete
+        ([(True, False), (True, True), (False, False)], (True, True)),
+        # mid in first position -> linked and complete, regardless of left
+        ([(False, True), (False, False)], (True, True)),
+        # left False before first mid -> not linked, not complete
+        ([(True, False), (False, False), (True, True)], (False, False)),
+        # left False in first position, no mid
+        ([(False, False)], (False, False)),
+        # all left True, no mid -> linked but not complete
+        ([(True, False), (True, False)], (True, False)),
+        # empty list -> linked but not complete
+        ([], (True, False)),
+    ],
+)
+def test_tagchain_is_linked(fixture_tag_logic_meta, tag_pairs, expected):
+    """Test _tagchain_is_linked returns correct (linked, complete) tuple."""
+    estimators = _named_components(
+        *[{"left": left, "mid": mid} for left, mid in tag_pairs]
+    )
+
+    result = fixture_tag_logic_meta._tagchain_is_linked(
+        left_tag_name="left", mid_tag_name="mid", estimators=estimators
+    )
+
+    assert result == expected
+
+
+def test_tagchain_is_linked_custom_values(fixture_tag_logic_meta):
+    """Test _tagchain_is_linked with non-default left_tag_val and mid_tag_val."""
+    estimators = _named_components(
+        {"left": "ok", "mid": "no"},
+        {"left": "ok", "mid": "stop"},
+        {"left": "bad", "mid": "no"},
+    )
+    kwargs = {"left_tag_name": "left", "mid_tag_name": "mid", "estimators": estimators}
+
+    linked = fixture_tag_logic_meta._tagchain_is_linked(
+        left_tag_val="ok", mid_tag_val="stop", **kwargs
+    )
+    assert linked == (True, True)
+
+    # with default values True/True, the first component already breaks the chain
+    not_linked = fixture_tag_logic_meta._tagchain_is_linked(**kwargs)
+    assert not_linked == (False, False)
+
+
+@pytest.mark.parametrize(
+    "tag_pairs, expected_left, expected_mid",
+    [
+        # linked and complete -> both set to "linked" values
+        ([(True, False), (True, True)], "L", "M"),
+        # linked, not complete -> left set to linked value, mid to "not" value
+        ([(True, False), (True, False)], "L", "M_not"),
+        # not linked -> both set to "not" values
+        ([(False, False), (True, True)], "L_not", "M_not"),
+    ],
+)
+def test_tagchain_is_linked_set(
+    fixture_tag_logic_meta, tag_pairs, expected_left, expected_mid
+):
+    """Test _tagchain_is_linked_set sets left and mid tags on self correctly."""
+    # map bool components to the string values used in the call below
+    to_left = {True: "L", False: "x"}
+    to_mid = {True: "M", False: "y"}
+    estimators = _named_components(
+        *[{"left": to_left[left], "mid": to_mid[mid]} for left, mid in tag_pairs]
+    )
+
+    fixture_tag_logic_meta._tagchain_is_linked_set(
+        left_tag_name="left",
+        mid_tag_name="mid",
+        estimators=estimators,
+        left_tag_val="L",
+        mid_tag_val="M",
+        left_tag_val_not="L_not",
+        mid_tag_val_not="M_not",
+    )
+
+    assert fixture_tag_logic_meta.get_tag("left") == expected_left
+    assert fixture_tag_logic_meta.get_tag("mid") == expected_mid
